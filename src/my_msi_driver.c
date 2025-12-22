@@ -29,7 +29,7 @@ int stop = 0;
  */
 void monitor_cpu_temperature(hid_device *handle) 
 {
-    int nr, ret, res;
+    int nr, ret;
     unsigned char buf[65];
     const sensors_chip_name *chip;
     const sensors_feature *feature;
@@ -64,7 +64,7 @@ void monitor_cpu_temperature(hid_device *handle)
                         while (!stop && ((subfeature = sensors_get_all_subfeatures(chip, feature, &ns)) != NULL)) {
                             if (subfeature->type == SENSORS_SUBFEATURE_TEMP_INPUT) {
                                 // Temperature subfeature found, initialize the hidapi library
-                                res = hid_init();
+                                hid_init();
                                 // Listen to temperature in an infinite loop
                                 while (!stop) {
                                     ret = sensors_get_value(chip, subfeature->number, &temp);
@@ -73,7 +73,7 @@ void monitor_cpu_temperature(hid_device *handle)
                                         // Set CPU status (cmd 0x85)
                                         buf[4] = itemp & 0xFF;
                                         buf[5] = (itemp >> 8) & 0xFF;
-                                        res = hid_write(handle, buf, 65);
+                                        hid_write(handle, buf, 65);
                                     }
                                     // Wait 2s
                                     usleep(2000*1000);
@@ -118,7 +118,7 @@ void set_fan_mode(hid_device *handle, int fan_mode)
  * Signal handler to stop the daemon.
  * Can take up to 2s to stop (sleeping time between temperature reads).
  */
-void stopit()
+void stopit(int dummy)
 {
     stop = 1;
 }
