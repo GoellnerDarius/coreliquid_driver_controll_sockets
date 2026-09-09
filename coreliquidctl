@@ -1,0 +1,187 @@
+#!/bin/sh
+# Talk to the coreliquid daemon's control socket.
+# See interface.md for the protocol this speaks.
+
+set -eu
+
+SOCK="${CORELIQUID_SOCK:-/run/coreliquid/control.sock}"
+CONTROL_GROUP=coreliquid
+
+usage()
+{
+    cat <<'EOF'
+Usage: coreliquidctl [command]
+
+Commands:
+  status, st             current mode and CPU temperature (the default)
+  silent,  s             switch to silent mode  (0)
+  balance, b             switch to balance mode (1)
+  game,    g             switch to game mode    (2)
+  default, d             switch to default mode (4)
+  smart,   m, sm         switch to smart mode   (5)
+  mode <n>               switch to mode n (0, 1, 2, 4 or 5)
+  ping, p                check that the daemon answers
+  raw <line>             send one protocol line as is
+
+Note that 's' is silent, not smart and not status: it is the first letter of
+the mode name. Smart is 'm' (or 'sm'), status is 'st' or no argument at all.
+
+The daemon only serves the socket between two temperature reads, so an
+answer can take up to 2s. A mode set this way is not kept across a restart
+of the daemon: change ExecStart in the unit file for that.
+EOF
+}
+
+# Name of a mode, for the status line
+mode_name()
+{
+    case "$1" in
+        0) echo silent ;;
+        1) echo balance ;;
+        2) echo game ;;
+        3) echo customize ;;
+        4) echo default ;;
+        5) echo smart ;;
+        *) echo unknown ;;
+    esac
+}
+
+# Explain the two failures that actually happen, rather than leaking the
+# transport's error message
+diagnose()
+{
+    if [ -S "$SOCK" ]; then
+        echo "coreliquidctl: cannot talk to $SOCK" >&2
+    elif [ -e "$SOCK" ]; then
+        echo "coreliquidctl: $SOCK is not a socket" >&2
+    elif [ -d "${SOCK%/*}" ] && [ ! -x "${SOCK%/*}" ]; then
+        echo "coreliquidctl: permission denied on $SOCK" >&2
+        echo >&2
+        if id -nG 2>/dev/null | grep -qw "$CONTROL_GROUP"; then
+            # In the group and still refused: the socket itself is wrong,
+            # most likely a daemon that started before the group existed
+            cat >&2 <<EOF
+You are in the $CONTROL_GROUP group, so the socket is not the one this daemon
+should have created. It falls back to root-only when the group does not exist
+at start-up; restarting the daemon makes it pick the group up:
+
+    sudo systemctl restart my_msi_driver
+    journalctl -u my_msi_driver -n 5    # 'No $CONTROL_GROUP group' if it still cannot
+EOF
+        elif getent group "$CONTROL_GROUP" 2>/dev/null | grep -qw "$(id -un)"; then
+            # The membership exists on disk but not in this process: a session
+            # older than the usermod that granted it
+            cat >&2 <<EOF
+You are already a member of the $CONTROL_GROUP group, but this shell started
+before that, and a process never picks up groups granted after it started.
+Running groupadd or usermod again will not change it.
+
+Start a subshell that does have the group:
+
+    newgrp $CONTROL_GROUP
+
+or use sudo, which does not need the group at all. Logging out and back in
+once fixes it everywhere, for good.
+EOF
+        else
+            cat >&2 <<EOF
+The socket is root:$CONTROL_GROUP mode 0660. Join the group, then log out and
+back in -- group membership is only picked up at login:
+
+    sudo groupadd -f $CONTROL_GROUP
+    sudo usermod -aG $CONTROL_GROUP "\$(id -un)"
+EOF
+        fi
+    else
+        cat >&2 <<EOF
+coreliquidctl: $SOCK does not exist
+
+The daemon holds it only while running with 'startd':
+
+    sudo systemctl start my_msi_driver
+EOF
+    fi
+    exit 1
+}
+
+# Send one line, print the daemon's answer
+send()
+{
+    line="$1"
+    if command -v socat >/dev/null 2>&1; then
+        answer=$(printf '%s\n' "$line" | socat -t3 - "UNIX-CONNECT:$SOCK" 2>/dev/null) || diagnose
+    elif command -v nc >/dev/null 2>&1; then
+        answer=$(printf '%s\n' "$line" | nc -U -w 3 "$SOCK" 2>/dev/null) || diagnose
+    elif command -v python3 >/dev/null 2>&1; then
+        answer=$(SOCK="$SOCK" LINE="$line" python3 -c '
+import os, socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(3.0)
+try:
+    s.connect(os.environ["SOCK"])
+    s.sendall(os.environ["LINE"].encode() + b"\n")
+    sys.stdout.write(s.recv(256).decode())
+except OSError:
+    sys.exit(1)
+') || diagnose
+    else
+        echo "coreliquidctl: need one of socat, nc or python3" >&2
+        exit 1
+    fi
+
+    # A daemon that hung up without answering
+    [ -n "$answer" ] || diagnose
+
+    case "$answer" in
+        ERR*)
+            echo "coreliquidctl: ${answer#ERR }" >&2
+            exit 1
+            ;;
+    esac
+    printf '%s\n' "$answer"
+}
+
+set_mode()
+{
+    send "MODE $1" >/dev/null
+    show_status
+}
+
+show_status()
+{
+    answer=$(send STATUS)
+    # OK mode=2 temp=41
+    mode=$(expr "$answer" : '.*mode=\([0-9]*\)' || true)
+    temp=$(expr "$answer" : '.*temp=\([0-9]*\)' || true)
+    if [ -n "$mode" ] && [ -n "$temp" ]; then
+        printf 'mode: %s (%s)\ntemp: %s C\n' "$(mode_name "$mode")" "$mode" "$temp"
+    else
+        # A daemon newer than this script may answer with more fields
+        printf '%s\n' "$answer"
+    fi
+}
+
+case "${1:-status}" in
+    status|st)      show_status ;;
+    silent|s)       set_mode 0 ;;
+    balance|b)      set_mode 1 ;;
+    game|g)         set_mode 2 ;;
+    default|d)      set_mode 4 ;;
+    smart|m|sm)     set_mode 5 ;;
+    mode)
+        [ $# -eq 2 ] || { usage >&2; exit 1; }
+        set_mode "$2"
+        ;;
+    ping|p)         send PING >/dev/null && echo "daemon alive" ;;
+    raw)
+        [ $# -ge 2 ] || { usage >&2; exit 1; }
+        shift
+        send "$*"
+        ;;
+    -h|--help|help) usage ;;
+    *)
+        echo "coreliquidctl: unknown command '$1'" >&2
+        usage >&2
+        exit 1
+        ;;
+esac

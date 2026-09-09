@@ -104,3 +104,83 @@ echo MODE 0 | nc -U /run/coreliquid/control.sock
 
 The daemon serves control clients between two temperature readings, so a command
 can take up to 2s to be answered.
+
+You rarely need to speak the protocol by hand, though: see
+[Command line client](#command-line-client) below.
+
+## Command line client
+
+Talking to the socket by hand gets old quickly, so `coreliquidctl` wraps it in a
+plain command. It is a POSIX shell script with no dependency beyond one of
+`socat`, `nc` or `python3`, whichever your system already has.
+
+### Install
+
+```bash
+sudo install -m 755 coreliquidctl /usr/local/bin/
+```
+
+The name is deliberately not `coreliquid`: that is the daemon binary, and the
+two live side by side in `/usr/local/bin`.
+
+Fish users can also install the completions, which offer the mode names, the
+mode numbers after `mode`, and the protocol lines after `raw`:
+
+```bash
+install -m 644 completions/coreliquidctl.fish ~/.config/fish/completions/
+# or, system wide:
+sudo install -m 644 completions/coreliquidctl.fish /usr/share/fish/vendor_completions.d/
+```
+
+### Use
+
+```bash
+coreliquidctl            # status, the default with no argument
+mode: game (2)
+temp: 41 C
+
+coreliquidctl game       # switch cooling mode
+coreliquidctl silent
+coreliquidctl ping
+daemon alive
+```
+
+Every mode has a one-letter alias, taken from the first letter of its name:
+
+| Command | Alias | Mode |
+| --- | --- | --- |
+| `status` | `st` | — |
+| `silent` | `s` | 0 |
+| `balance` | `b` | 1 |
+| `game` | `g` | 2 |
+| `default` | `d` | 4 |
+| `smart` | `m`, `sm` | 5 |
+| `ping` | `p` | — |
+
+Note that `s` is **silent**, not smart and not status. Smart is `m`, and status
+is `st` or simply no argument at all.
+
+Two commands take an argument: `coreliquidctl mode `*n* sets a mode by number,
+for the same values as **-M**, and `coreliquidctl raw `*line* sends one protocol
+line unchanged, which is how you reach anything this script does not know about
+yet.
+
+The client exits non-zero when the daemon answers `ERR`, or when it cannot be
+reached at all, so it composes in scripts:
+
+```bash
+coreliquidctl game || echo "the AIO did not take it" >&2
+```
+
+`CORELIQUID_SOCK` overrides the socket path, which is useful against a stub
+daemon when you develop without the hardware.
+
+### When it cannot connect
+
+The socket is `root:coreliquid` mode 0660, so the two failures you will actually
+meet are a stopped daemon and a missing group. `coreliquidctl` tells them apart
+and says what to do, including the case that catches everyone once: you have
+been added to the `coreliquid` group, but your session started before that, and
+a running process never picks up groups granted after it started. Re-running
+`usermod` does nothing there. Either start a subshell that has the group, with
+`newgrp coreliquid`, or use `sudo`. Logging out and back in fixes it for good.
