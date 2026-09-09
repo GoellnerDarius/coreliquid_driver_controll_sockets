@@ -1,6 +1,21 @@
 # coreliquid_driver
+
+
 A simple linux driver for MSI MEG Coreliquid S360 AIO watercooling
 
+## About this fork
+This is a fork of [sarzeaud/coreliquid_driver](https://github.com/sarzeaud/coreliquid_driver).
+
+Upstream, the cooling mode is fixed when the program starts: changing it means
+restarting the daemon. This fork adds a **control socket**, a Unix socket the
+running daemon listens on, so that other programs can interface with it — read
+the current mode and CPU temperature, or switch the cooling mode on the fly,
+without a restart. See [Control socket](#control-socket) below for the protocol.
+
+Everything else behaves as upstream; the rest of this README describes the
+driver as a whole.
+
+## Why
 Having unsuccessfully tried to use liquidctl (https://github.com/liquidctl/liquidctl) 
 to drive my MSI MEG coreliquid AIO watercooling under linux (specifically Debian 12), 
 I decided to build mine. I don't care about the display on this AIO, I just want it 
@@ -58,3 +73,34 @@ The driver will start as a daemon on next boot. If you want it to run at once:
 ```bash
 sudo systemctl start my_msi_driver
 ```
+
+## Control socket
+While running as a daemon, the driver listens on a Unix socket at
+`/run/coreliquid/control.sock`, so that the cooling mode can be changed without
+restarting it. The socket belongs to the `coreliquid` group and is only readable
+by root if that group doesn't exist, so create it and add yourself to it:
+
+```bash
+sudo groupadd -f coreliquid
+sudo usermod -aG coreliquid $USER
+```
+
+You need to log out and back in for the new group to apply.
+
+The protocol is one line of text per connection, and the daemon answers with a
+single line starting with either `OK` or `ERR`:
+
+| Command | Answer | Effect |
+| --- | --- | --- |
+| `MODE `*n* | `OK` | Sets the cooling mode, same values as **-M** |
+| `STATUS` | `OK mode=5 temp=42` | Current mode and last CPU temperature read |
+| `PING` | `OK` | Checks that the daemon is alive |
+
+For instance:
+
+```bash
+echo MODE 0 | nc -U /run/coreliquid/control.sock
+```
+
+The daemon serves control clients between two temperature readings, so a command
+can take up to 2s to be answered.

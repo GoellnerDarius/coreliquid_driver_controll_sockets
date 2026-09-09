@@ -4,6 +4,9 @@ Description=MSI MEG CoreLiquid S360 Daemon
 [Service]
 Type=simple
 ExecStart=/where/you/put/my_msi_driver -M 5 startd
+# Holds the control socket. systemd removes it when the service stops.
+RuntimeDirectory=coreliquid
+RuntimeDirectoryMode=0750
 ExecReload=/bin/kill -HUP $MAINPID
 ExecStop=/bin/kill -TERM $MAINPID
 KillMode=mixed

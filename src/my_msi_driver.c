@@ -6,8 +6,22 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <errno.h>
+#include <time.h>
+#include <poll.h>
+#include <grp.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <hidapi/hidapi.h>
 #include <sensors/sensors.h>
+
+// Where the daemon listens for control commands
+#define CONTROL_DIR   "/run/coreliquid"
+#define CONTROL_SOCK  CONTROL_DIR "/control.sock"
+// Members of this group may talk to the daemon. If it doesn't exist on the
+// system, the socket stays root-only.
+#define CONTROL_GROUP "coreliquid"
 
 // Fan modes, unused
 typedef enum FanMode {
@@ -22,12 +36,186 @@ typedef enum FanMode {
 // Flag to stop the daemon
 int stop = 0;
 
+// State reported to control clients
+int current_mode = SMART;
+int current_temp = 0;
+
+void set_fan_mode(hid_device *handle, int fan_mode);
+
 /**
- * Monitor the CPU temperature and send it to the AIO.
- * 
+ * Current value of the monotonic clock, in milliseconds.
+ */
+long now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+/**
+ * Create the control socket the user interface connects to.
+ *
+ * \return the listening socket, or -1 if it could not be created
+ */
+int control_open(void)
+{
+    int fd;
+    struct sockaddr_un addr;
+    struct group *grp;
+
+    if ((mkdir(CONTROL_DIR, 0750) != 0) && (errno != EEXIST)) {
+        fprintf(stderr, "Cannot create %s: %s\n", CONTROL_DIR, strerror(errno));
+        return -1;
+    }
+    // A socket left behind by a previous run would make bind() fail
+    unlink(CONTROL_SOCK);
+
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        fprintf(stderr, "Cannot create control socket: %s\n", strerror(errno));
+        return -1;
+    }
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, CONTROL_SOCK, sizeof(addr.sun_path) - 1);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr, "Cannot bind %s: %s\n", CONTROL_SOCK, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    if (listen(fd, 4) != 0) {
+        fprintf(stderr, "Cannot listen on %s: %s\n", CONTROL_SOCK, strerror(errno));
+        close(fd);
+        unlink(CONTROL_SOCK);
+        return -1;
+    }
+
+    // Hand the socket over to the control group, so that the interface doesn't
+    // have to run as root
+    grp = getgrnam(CONTROL_GROUP);
+    if (grp != NULL) {
+        chown(CONTROL_DIR, 0, grp->gr_gid);
+        chown(CONTROL_SOCK, 0, grp->gr_gid);
+    }
+    else
+        fprintf(stderr, "No %s group, control socket restricted to root\n", CONTROL_GROUP);
+    chmod(CONTROL_DIR, 0750);
+    chmod(CONTROL_SOCK, 0660);
+
+    return fd;
+}
+
+/**
+ * Execute one control command and build the answer sent back to the client.
+ *
+ * \param handle handle on the AIO device
+ * \param cmd the command line received from the client
+ * \param answer buffer the answer is written to
+ * \param answer_size size of the answer buffer
+ */
+void control_execute(hid_device *handle, const char *cmd, char *answer, size_t answer_size)
+{
+    int mode;
+
+    if (sscanf(cmd, "MODE %d", &mode) == 1) {
+        if ((mode < 0) || (mode > 5) || (mode == CUSTOMIZE)) {
+            snprintf(answer, answer_size, "ERR unsupported mode %d\n", mode);
+            return;
+        }
+        set_fan_mode(handle, mode);
+        current_mode = mode;
+        snprintf(answer, answer_size, "OK\n");
+    }
+    else if (!strcmp(cmd, "STATUS"))
+        snprintf(answer, answer_size, "OK mode=%d temp=%d\n", current_mode, current_temp);
+    else if (!strcmp(cmd, "PING"))
+        snprintf(answer, answer_size, "OK\n");
+    else
+        snprintf(answer, answer_size, "ERR unknown command\n");
+}
+
+/**
+ * Accept one client, answer its command, and hang up.
+ *
+ * \param listen_fd the listening control socket
  * \param handle handle on the AIO device
  */
-void monitor_cpu_temperature(hid_device *handle) 
+void control_serve(int listen_fd, hid_device *handle)
+{
+    int fd;
+    ssize_t n;
+    char cmd[256], answer[256];
+    struct timeval tv;
+
+    fd = accept(listen_fd, NULL, NULL);
+    if (fd < 0)
+        return;
+
+    // A client that connects and says nothing must not stall the temperature loop
+    tv.tv_sec = 0;
+    tv.tv_usec = 200*1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    n = recv(fd, cmd, sizeof(cmd) - 1, 0);
+    if (n > 0) {
+        cmd[n] = '\0';
+        cmd[strcspn(cmd, "\r\n")] = '\0';
+        control_execute(handle, cmd, answer, sizeof(answer));
+        send(fd, answer, strlen(answer), 0);
+    }
+    close(fd);
+}
+
+/**
+ * Serve control clients for at most timeout_ms milliseconds. This replaces the
+ * plain sleep the temperature loop used to do between two reads.
+ *
+ * \param listen_fd the listening control socket, or -1 if there is none
+ * \param handle handle on the AIO device
+ * \param timeout_ms how long to wait before returning
+ */
+void control_poll(int listen_fd, hid_device *handle, int timeout_ms)
+{
+    struct pollfd pfd;
+    long deadline = now_ms() + timeout_ms;
+    long remaining;
+    int ret;
+
+    while (!stop) {
+        remaining = deadline - now_ms();
+        if (remaining <= 0)
+            break;
+        if (listen_fd < 0) {
+            // No control socket, just wait out the rest of the period
+            usleep(remaining * 1000);
+            break;
+        }
+        pfd.fd = listen_fd;
+        pfd.events = POLLIN;
+        ret = poll(&pfd, 1, (int)remaining);
+        if (ret > 0)
+            control_serve(listen_fd, handle);
+        else if (ret == 0)
+            break;
+        else if (errno != EINTR) {
+            // Don't spin on a broken poll
+            fprintf(stderr, "poll failed: %s\n", strerror(errno));
+            usleep(remaining * 1000);
+            break;
+        }
+        // EINTR: the stop flag is checked on the next turn
+    }
+}
+
+/**
+ * Monitor the CPU temperature and send it to the AIO.
+ *
+ * \param handle handle on the AIO device
+ * \param listen_fd the listening control socket, or -1 if there is none
+ */
+void monitor_cpu_temperature(hid_device *handle, int listen_fd)
 {
     int nr, ret;
     unsigned char buf[65];
@@ -53,7 +241,7 @@ void monitor_cpu_temperature(hid_device *handle)
     // Loop on chips
     nr = 0;
     while (!stop && ((chip = sensors_get_detected_chips(NULL, &nr)) != NULL)) {
-        if (!strcmp(chip->prefix, "coretemp")) { // This chip gives CPU temperatures
+        if (!strcmp(chip->prefix, "coretemp") || !strcmp(chip->prefix, "k10temp") || !strcmp(chip->prefix, "k10temp") || !strcmp(chip->prefix, "k10temp")) { // This chip gives CPU temperatures
             // Loop on features for this chip
             int nf = 0;
             while (!stop && ((feature = sensors_get_features(chip, &nf)) != NULL)) {
@@ -70,13 +258,14 @@ void monitor_cpu_temperature(hid_device *handle)
                                     ret = sensors_get_value(chip, subfeature->number, &temp);
                                     if (ret == 0) {
                                         itemp = (int)temp;
+                                        current_temp = itemp;
                                         // Set CPU status (cmd 0x85)
                                         buf[4] = itemp & 0xFF;
                                         buf[5] = (itemp >> 8) & 0xFF;
                                         hid_write(handle, buf, 65);
                                     }
-                                    // Wait 2s
-                                    usleep(2000*1000);
+                                    // Wait 2s, serving control clients meanwhile
+                                    control_poll(listen_fd, handle, 2000);
                                 }
                             }
                         }
@@ -130,8 +319,9 @@ int main(int argc, char *argv[])
 {
     int i, fan_mode = SMART;
     int start_daemon = 0;
+    int listen_fd = -1;
     hid_device *handle = NULL;
-    
+
     // Check options
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-M")) {
@@ -154,11 +344,24 @@ int main(int argc, char *argv[])
     hid_init();
     // Open the device using the VID, PID
     handle = hid_open(0x0db0, 0x6a05, NULL);
+    if (handle == NULL) {
+        fprintf(stderr, "Cannot open the AIO device. Is it plugged in, and do you have the rights?\n");
+        hid_exit();
+        exit(1);
+    }
     set_fan_mode(handle, fan_mode);
+    current_mode = fan_mode;
     // Start daemon if requested
     if (start_daemon) {
         signal(SIGTERM, stopit);
-        monitor_cpu_temperature(handle);
+        // A client hanging up mid-answer must not kill the daemon
+        signal(SIGPIPE, SIG_IGN);
+        listen_fd = control_open();
+        monitor_cpu_temperature(handle, listen_fd);
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            unlink(CONTROL_SOCK);
+        }
     }
     // Close the device
     hid_close(handle);
